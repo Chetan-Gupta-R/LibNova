@@ -645,6 +645,7 @@ with st.sidebar:
     [
         "Overview",
         "Mathematical Model",
+        "Optimization Lab",
         "Book Catalog",
         "Members",
         "Circulation",
@@ -1444,6 +1445,412 @@ elif page == "Mathematical Model":
             "This page does not issue books or modify records. "
             "The circulation service is still the authority for "
             "actual borrowing decisions."
+        )
+
+
+# --------------------------------------------------
+# OPTIMIZATION LAB — SMART ALLOCATION & WAITLIST
+# --------------------------------------------------
+
+elif page == "Optimization Lab":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Optimization Lab</h1>
+            <p>
+                Mathematical decision support for book allocation
+                and reservation queue analysis.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # This page only generates recommendations.
+    # It does not write to the database or alter service rules.
+
+    SIMULATION_CAPACITY = 5
+
+    # Safe access for dictionaries and sqlite3.Row objects.
+    def opt_value(row, key, default=None):
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+    # Fetch the current waiting queue through the existing service.
+    waiting_reservations = services.list_reservations()
+
+    # ------------------------------
+    # OPTIMIZATION OVERVIEW
+    # ------------------------------
+
+    st.subheader("Planning overview")
+
+    o1, o2, o3 = st.columns(3)
+    o1.metric("Planning Capacity", SIMULATION_CAPACITY)
+    o2.metric("Books in Catalog", len(books))
+    o3.metric("Waiting Reservations", len(waiting_reservations))
+
+    st.info(
+        "Simulation only: the five additional copies are hypothetical. "
+        "No books, reservations, or inventory counts will be changed."
+    )
+
+    allocation_tab, reservation_tab, model_tab = st.tabs(
+        [
+            "Smart Allocation",
+            "Reservation Priority",
+            "Mathematical Model",
+        ]
+    )
+
+    # ==================================================
+    # TAB 1 — SMART BOOK ALLOCATION
+    # ==================================================
+
+    with allocation_tab:
+        st.subheader("Smart Book Allocation")
+
+        st.write(
+            "The algorithm recommends where five hypothetical new "
+            "copies would be most useful. It uses historical loan "
+            "counts and waiting reservations as demand signals."
+        )
+
+        if not books:
+            st.info("Add books to the catalog before running allocation.")
+        else:
+            # Count recorded loan transactions per book.
+            loan_counts = {}
+
+            for loan in loans:
+                book_id = opt_value(loan, "book_id")
+                if book_id is not None:
+                    loan_counts[book_id] = (
+                        loan_counts.get(book_id, 0) + 1
+                    )
+
+            # Count waiting reservations per book.
+            reservation_counts = {}
+
+            for reservation in waiting_reservations:
+                book_id = opt_value(reservation, "book_id")
+                if book_id is not None:
+                    reservation_counts[book_id] = (
+                        reservation_counts.get(book_id, 0) + 1
+                    )
+
+            candidates = []
+
+            for book in books:
+                book_id = opt_value(book, "id")
+                title = opt_value(book, "title", "Untitled")
+                total = int(opt_value(book, "total_copies", 0) or 0)
+                available = int(
+                    opt_value(book, "available_copies", 0) or 0
+                )
+
+                past_loans = loan_counts.get(book_id, 0)
+                waiting = reservation_counts.get(book_id, 0)
+
+                # Reservation demand receives extra weight because
+                # these members are currently waiting for a book.
+                demand_score = past_loans + (2 * waiting)
+
+                # A baseline score of 1 ensures every book can be
+                # considered even when it has no recorded demand.
+                demand_weight = max(1, demand_score)
+
+                candidates.append(
+                    {
+                        "id": book_id,
+                        "title": title,
+                        "total_copies": total,
+                        "available_copies": available,
+                        "past_loans": past_loans,
+                        "waiting_reservations": waiting,
+                        "demand_score": demand_score,
+                        "demand_weight": demand_weight,
+                        "recommended": 0,
+                    }
+                )
+
+            # Greedy marginal-benefit allocation.
+            # Each new copy goes to the book with the highest score:
+            #
+            # marginal score = demand weight /
+            #                  (existing total copies + allocated copies + 1)
+            #
+            # The denominator creates diminishing returns as copies
+            # are allocated to the same title.
+            allocation_steps = []
+
+            for step in range(SIMULATION_CAPACITY):
+                best = max(
+                    candidates,
+                    key=lambda item: (
+                        item["demand_weight"]
+                        / (
+                            item["total_copies"]
+                            + item["recommended"]
+                            + 1
+                        ),
+                        -item["total_copies"],
+                        -item["id"],
+                    ),
+                )
+
+                marginal_score = best["demand_weight"] / (
+                    best["total_copies"] + best["recommended"] + 1
+                )
+
+                best["recommended"] += 1
+
+                allocation_steps.append(
+                    {
+                        "Copy Number": step + 1,
+                        "Recommended Book": best["title"],
+                        "Marginal Score": round(marginal_score, 3),
+                    }
+                )
+
+            allocation_results = []
+
+            for item in candidates:
+                allocation_results.append(
+                    {
+                        "Book": item["title"],
+                        "Current Copies": item["total_copies"],
+                        "Available Now": item["available_copies"],
+                        "Historical Loans": item["past_loans"],
+                        "Waiting Reservations": (
+                            item["waiting_reservations"]
+                        ),
+                        "Demand Score": item["demand_score"],
+                        "Recommended New Copies": item["recommended"],
+                    }
+                )
+
+            allocation_df = pd.DataFrame(allocation_results)
+
+            allocation_df = allocation_df.sort_values(
+                by=["Recommended New Copies", "Demand Score", "Book"],
+                ascending=[False, False, True],
+            )
+
+            total_recommended = int(
+                allocation_df["Recommended New Copies"].sum()
+            )
+
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Copies Planned", total_recommended)
+            a2.metric(
+                "Titles Receiving Copies",
+                int(
+                    (
+                        allocation_df["Recommended New Copies"] > 0
+                    ).sum()
+                ),
+            )
+            a3.metric(
+                "Recorded Loan Transactions",
+                sum(loan_counts.values()),
+            )
+
+            st.markdown("#### Recommended allocation")
+
+            st.dataframe(
+                allocation_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("#### Step-by-step allocation")
+
+            st.caption(
+                "Each row shows which book received the next "
+                "hypothetical copy and its marginal score at that step."
+            )
+
+            st.dataframe(
+                pd.DataFrame(allocation_steps),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            chart_df = allocation_df[
+                ["Book", "Recommended New Copies"]
+            ].set_index("Book")
+
+            st.bar_chart(
+                chart_df,
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Demand Score = historical loan count + "
+                "2 × waiting reservation count. The greedy algorithm "
+                "uses diminishing marginal scores; it is a heuristic, "
+                "not a guarantee of global optimality."
+            )
+
+    # ==================================================
+    # TAB 2 — RESERVATION PRIORITY
+    # ==================================================
+
+    with reservation_tab:
+        st.subheader("Reservation Queue Analysis")
+
+        st.write(
+            "The existing queue is displayed oldest-first using "
+            "its recorded creation time. This is a read-only view "
+            "and does not change reservation order in the database."
+        )
+
+        if not waiting_reservations:
+            st.success("There are no waiting reservations currently.")
+        else:
+            queue_rows = []
+
+            for reservation in waiting_reservations:
+                queue_rows.append(
+                    {
+                        "Reservation ID": opt_value(
+                            reservation, "id"
+                        ),
+                        "Book": opt_value(
+                            reservation, "title", "Unknown book"
+                        ),
+                        "Member": opt_value(
+                            reservation, "full_name", "Unknown member"
+                        ),
+                        "Member Code": opt_value(
+                            reservation, "member_code", "—"
+                        ),
+                        "Status": opt_value(
+                            reservation, "status", "WAITING"
+                        ),
+                        "Created": opt_value(
+                            reservation, "created_at", ""
+                        ),
+                    }
+                )
+
+            queue_df = pd.DataFrame(queue_rows)
+
+            if "Created" in queue_df.columns:
+                queue_df["_sort_time"] = pd.to_datetime(
+                    queue_df["Created"],
+                    errors="coerce",
+                )
+
+                queue_df = queue_df.sort_values(
+                    by=["_sort_time", "Reservation ID"],
+                    ascending=True,
+                    na_position="last",
+                )
+
+                queue_df = queue_df.drop(columns=["_sort_time"])
+
+            queue_df.insert(
+                0,
+                "Suggested Position",
+                range(1, len(queue_df) + 1),
+            )
+
+            st.dataframe(
+                queue_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("#### Queue summary")
+
+            summary = (
+                queue_df.groupby("Book")
+                .size()
+                .reset_index(name="Waiting Members")
+                .sort_values(
+                    "Waiting Members",
+                    ascending=False,
+                )
+            )
+
+            st.dataframe(
+                summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "Suggested positions are calculated for display only. "
+                "Actual reservation fulfillment remains governed by "
+                "the existing services.py implementation."
+            )
+
+    # ==================================================
+    # TAB 3 — MATHEMATICAL MODEL
+    # ==================================================
+
+    with model_tab:
+        st.subheader("Optimization Model")
+
+        st.markdown(
+            "Let each book be indexed by i. The decision variable "
+            "xᵢ is the number of hypothetical additional copies "
+            "allocated to that book."
+        )
+
+        st.latex(
+            r"\sum_{i=1}^{n} x_i = 5, "
+            r"\qquad x_i \in \mathbb{Z}_{\geq 0}"
+        )
+
+        st.markdown("**Demand weight**")
+
+        st.latex(
+            r"w_i = \max(1,\; L_i + 2R_i)"
+        )
+
+        st.markdown(
+            "Here, Lᵢ is the historical loan count and Rᵢ is the "
+            "number of waiting reservations for book i."
+        )
+
+        st.markdown("**Greedy marginal score**")
+
+        st.latex(
+            r"S_i(x_i) = \frac{w_i}{T_i + x_i + 1}"
+        )
+
+        st.markdown(
+            """
+            - \(T_i\): current total copies of book i.
+            - \(x_i\): additional copies already allocated to book i.
+            - \(w_i\): demand weight calculated from recorded data.
+            - At each step, the algorithm assigns one copy to the
+              candidate with the highest marginal score.
+            """
+        )
+
+        st.warning(
+            "This is a greedy allocation heuristic for academic "
+            "demonstration. It does not model purchase costs, budget "
+            "limits, or predicted future demand because those inputs "
+            "are not currently established in the app's data."
+        )
+
+        st.markdown("#### Reservation priority rule")
+
+        st.latex(
+            r"P(r) = \operatorname{rank}(\text{created\_at}_r)"
+        )
+
+        st.write(
+            "Reservations are displayed in first-in, first-out order: "
+            "older waiting reservations receive earlier suggested "
+            "positions. This page does not modify the live queue."
         )
 
 
