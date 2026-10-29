@@ -646,6 +646,7 @@ with st.sidebar:
         "Overview",
         "Mathematical Model",
         "Optimization Lab",
+        "Book Recommendations",
         "Book Catalog",
         "Members",
         "Circulation",
@@ -1852,6 +1853,359 @@ elif page == "Optimization Lab":
             "older waiting reservations receive earlier suggested "
             "positions. This page does not modify the live queue."
         )
+
+
+
+# --------------------------------------------------
+# BOOK RECOMMENDATIONS — EXPLAINABLE ENGINE
+# --------------------------------------------------
+
+elif page == "Book Recommendations":
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>Smart Book Recommendations</h1>
+            <p>
+                Discover relevant books using borrowing history,
+                category preferences, popularity, and availability.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def rec_value(row, key, default=None):
+        """Read a field safely from a dictionary or SQLite row."""
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return default
+
+    if not members or not books:
+        st.info(
+            "Add at least one member and one book before "
+            "generating personalized recommendations."
+        )
+
+    else:
+        # ------------------------------------------
+        # MEMBER SELECTION
+        # ------------------------------------------
+
+        member_labels = {
+            (
+                f'{rec_value(m, "member_code", rec_value(m, "id"))}'
+                f' — {rec_value(m, "full_name", "Member")}'
+            ): m
+            for m in members
+        }
+
+        selected_label = st.selectbox(
+            "Select a library member",
+            list(member_labels.keys()),
+            key="recommendation_member",
+        )
+
+        selected_member = member_labels[selected_label]
+        selected_member_id = rec_value(selected_member, "id")
+
+        # ------------------------------------------
+        # BUILD BORROWING HISTORY
+        # ------------------------------------------
+
+        member_history = [
+            loan for loan in loans
+            if rec_value(loan, "member_id") == selected_member_id
+        ]
+
+        previously_borrowed_ids = {
+            rec_value(loan, "book_id")
+            for loan in member_history
+            if rec_value(loan, "book_id") is not None
+        }
+
+        # Categories the selected member has borrowed from.
+        book_by_id = {
+            rec_value(book, "id"): book
+            for book in books
+        }
+
+        preferred_categories = {}
+
+        for loan in member_history:
+            book_id = rec_value(loan, "book_id")
+            borrowed_book = book_by_id.get(book_id)
+
+            if borrowed_book is None:
+                continue
+
+            category = str(
+                rec_value(borrowed_book, "category", "") or ""
+            ).strip()
+
+            if category:
+                preferred_categories[category] = (
+                    preferred_categories.get(category, 0) + 1
+                )
+
+        # ------------------------------------------
+        # GLOBAL POPULARITY
+        # ------------------------------------------
+
+        loan_counts = {}
+
+        for loan in loans:
+            book_id = rec_value(loan, "book_id")
+
+            if book_id is not None:
+                loan_counts[book_id] = (
+                    loan_counts.get(book_id, 0) + 1
+                )
+
+        max_loan_count = max(loan_counts.values(), default=0)
+
+        # ------------------------------------------
+        # RECOMMENDATION SCORING
+        # ------------------------------------------
+
+        recommendations = []
+
+        for book in books:
+            book_id = rec_value(book, "id")
+            title = rec_value(book, "title", "Untitled")
+            category = str(
+                rec_value(book, "category", "") or ""
+            ).strip()
+            author = rec_value(book, "author", "Unknown author")
+            available = int(
+                rec_value(book, "available_copies", 0) or 0
+            )
+            historical_loans = loan_counts.get(book_id, 0)
+
+            # Avoid recommending books this member has already
+            # borrowed, including books they borrowed in the past.
+            if book_id in previously_borrowed_ids:
+                continue
+
+            # This first version recommends books that can
+            # currently be borrowed.
+            if available <= 0:
+                continue
+
+            # 1. Category preference: strongest signal.
+            category_count = preferred_categories.get(category, 0)
+
+            if category_count > 0:
+                category_score = min(
+                    60,
+                    30 + 10 * (category_count - 1),
+                )
+                category_reason = (
+                    f"You have borrowed {category_count} book(s) "
+                    f"in the {category} category."
+                )
+            else:
+                category_score = 0
+                category_reason = ""
+
+            # 2. Popularity: normalized to a maximum of 25 points.
+            popularity_score = (
+                25 * historical_loans / max_loan_count
+                if max_loan_count > 0
+                else 0
+            )
+
+            # 3. Availability bonus: up to 15 points.
+            availability_score = min(15, 5 * available)
+
+            total_score = round(
+                category_score
+                + popularity_score
+                + availability_score,
+                1,
+            )
+
+            reasons = []
+
+            if category_reason:
+                reasons.append(category_reason)
+
+            if historical_loans > 0:
+                reasons.append(
+                    f"Borrowed {historical_loans} time(s) "
+                    "across the library."
+                )
+
+            if available > 0:
+                reasons.append(
+                    f"{available} copy/copies available now."
+                )
+
+            if not reasons:
+                reasons.append(
+                    "Available title from the library collection."
+                )
+
+            recommendations.append(
+                {
+                    "Book ID": book_id,
+                    "Title": title,
+                    "Author": author,
+                    "Category": category or "Uncategorized",
+                    "Available Copies": available,
+                    "Historical Loans": historical_loans,
+                    "Category Score": round(category_score, 1),
+                    "Popularity Score": round(popularity_score, 1),
+                    "Availability Score": round(availability_score, 1),
+                    "Recommendation Score": total_score,
+                    "Why Recommended": " ".join(reasons),
+                    "_category_match": category_count,
+                }
+            )
+
+        # ------------------------------------------
+        # RESULTS
+        # ------------------------------------------
+
+        st.divider()
+        st.subheader("Your recommendation profile")
+
+        p1, p2, p3 = st.columns(3)
+
+        p1.metric("Recorded Borrowings", len(member_history))
+        p2.metric("Preferred Categories", len(preferred_categories))
+        p3.metric(
+            "Books Available to Recommend",
+            len(recommendations),
+        )
+
+        if preferred_categories:
+            st.markdown("#### Categories in your borrowing history")
+
+            category_df = pd.DataFrame(
+                [
+                    {
+                        "Category": category,
+                        "Borrowings": count,
+                    }
+                    for category, count in preferred_categories.items()
+                ]
+            ).sort_values("Borrowings", ascending=False)
+
+            st.dataframe(
+                category_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "This member has no recorded borrowing history yet. "
+                "Recommendations will use overall popularity and "
+                "book availability until history is available."
+            )
+
+        if recommendations:
+            results_df = pd.DataFrame(recommendations)
+
+            # Personalized matches first, followed by popularity,
+            # availability, and title as deterministic tie-breakers.
+            results_df = results_df.sort_values(
+                by=[
+                    "_category_match",
+                    "Recommendation Score",
+                    "Title",
+                ],
+                ascending=[False, False, True],
+            ).reset_index(drop=True)
+
+            top_n = st.slider(
+                "Number of recommendations",
+                min_value=3,
+                max_value=15,
+                value=5,
+                key="recommendation_count",
+            )
+
+            st.markdown("#### Recommended for this member")
+
+            # Display individual cards with an explanation.
+            for _, result in results_df.head(top_n).iterrows():
+                with st.container(border=True):
+                    st.markdown(f"### {result['Title']}")
+                    st.caption(
+                        f"{result['Author']} · {result['Category']}"
+                    )
+
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric(
+                        "Match Score",
+                        f"{result['Recommendation Score']}/100",
+                    )
+                    c2.metric(
+                        "Available",
+                        int(result["Available Copies"]),
+                    )
+                    c3.metric(
+                        "Past Borrowings",
+                        int(result["Historical Loans"]),
+                    )
+
+                    st.write("**Why this book?**")
+                    st.write(result["Why Recommended"])
+
+                    with st.expander("View score breakdown"):
+                        st.write(
+                            f"Category preference: "
+                            f"{result['Category Score']} points"
+                        )
+                        st.write(
+                            f"Library popularity: "
+                            f"{result['Popularity Score']} points"
+                        )
+                        st.write(
+                            f"Availability: "
+                            f"{result['Availability Score']} points"
+                        )
+
+            st.divider()
+            st.markdown("#### Compare all recommendation scores")
+
+            comparison_columns = [
+                "Title",
+                "Category",
+                "Recommendation Score",
+                "Category Score",
+                "Popularity Score",
+                "Availability Score",
+                "Available Copies",
+            ]
+
+            st.dataframe(
+                results_df[comparison_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.bar_chart(
+                results_df.head(top_n).set_index("Title")[
+                    ["Recommendation Score"]
+                ],
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Scores are heuristic relevance scores, not measured "
+                "probabilities. They are calculated from existing "
+                "borrowing history, category matches, and available "
+                "copies. No records are changed by this page."
+            )
+
+        else:
+            st.info(
+                "No unborrowed, currently available books were found "
+                "for this member. Add titles or update inventory "
+                "through your existing catalog and circulation pages."
+            )
 
 
 # --------------------------------------------------
